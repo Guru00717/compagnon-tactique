@@ -137,7 +137,7 @@ footer b{color:var(--muted)}
 </div>
 
 <footer>
-  <b>Sources</b> — prix temps réel : gold-api.com (sans clé, CORS) ; historique quotidien or : freegoldapi.com (Yahoo GC=F, quotidien depuis 2025) ; change USD/EUR : Frankfurter (BCE) ; positionnement : CFTC Commitments of Traders (rapport Disaggregated, dataset 72hh-3qpy). Les fournisseurs de prix gratuits sont des services indépendants : qualité « spot indicatif », fiabilité non garantie dans le temps.<br><br>
+  <b>Sources</b> — prix temps réel : gold-api.com (sans clé, CORS) ; historique quotidien or/argent : flux auto-hébergé, alimenté chaque jour par une GitHub Action (données Stooq, clôtures), avec repli Stooq via proxy puis freegoldapi ; change USD/EUR : intégré au flux auto-hébergé (Stooq eurusd) ; positionnement : CFTC Commitments of Traders (rapport Disaggregated, dataset 72hh-3qpy). Qualité « spot indicatif » ; une alarme signale automatiquement tout historique de plus de 7 jours.<br><br>
   <b>Avertissement</b> — Information factuelle et états de marché. Ne constitue pas un conseil en investissement ni une recommandation. CUSTODIUM ne dispose pas d'un agrément de conseiller en investissements financiers. Les performances et positionnements passés ne préjugent pas de l'avenir.
 </footer>
 
@@ -145,10 +145,10 @@ footer b{color:var(--muted)}
 const SRC={
   goldRT:'https://api.gold-api.com/price/XAU',
   silverRT:'https://api.gold-api.com/price/XAG',
-  goldHist:'https://freegoldapi.com/data/latest.json',
-  ratioHist:'https://freegoldapi.com/data/gold_silver_ratio_enriched.csv',
-  fxLatest:'https://api.frankfurter.app/latest?from=USD&to=EUR',
-  fxSeries:'https://api.frankfurter.app/2025-01-01..?from=USD&to=EUR',
+  selfFeed:'./data/metals_daily.json',                       /* robuste : flux auto-hébergé (GitHub Action) */
+  proxy:'https://api.allorigins.win/raw?url=',               /* repli immédiat (stopgap) */
+  stooq:(sym)=>'https://stooq.com/q/d/l/?s='+sym+'&i=d',
+  goldHistFallback:'https://freegoldapi.com/data/latest.json',/* dernier recours (peut être périmé) */
   cot:(name)=>'https://publicreporting.cftc.gov/resource/72hh-3qpy.json?$where='+
       encodeURIComponent("market_and_exchange_names like '"+name+" - COMMODITY EXCHANGE%'")+
       '&$order=report_date_as_yyyy_mm_dd%20DESC&$limit=300'
@@ -157,35 +157,29 @@ const CHART_GRID='#241f16', CHART_TICK='#8a836f';
 const fmt=(n,d=0)=>n==null||isNaN(n)?'—':n.toLocaleString('fr-FR',{minimumFractionDigits:d,maximumFractionDigits:d});
 const sign=(n,d=1)=>(n>=0?'+':'')+fmt(n,d);
 
-/* ---- diagnostics ---- */
-const SOURCES=['prix RT','historique or','change EUR','ratio argent','COT or','COT argent'];
-const diagEl=document.getElementById('diag');
-const chips={};
+const SOURCES=['prix RT','historique','change EUR','COT or','COT argent'];
+const diagEl=document.getElementById('diag'), chips={};
 SOURCES.forEach(s=>{const c=document.createElement('div');c.className='chip load';c.innerHTML='<i></i>'+s;diagEl.appendChild(c);chips[s]=c;});
-const setChip=(s,ok)=>{const c=chips[s];if(!c)return;c.className='chip '+(ok?'ok':'err');};
+const setChip=(s,ok)=>{const c=chips[s];if(c)c.className='chip '+(ok?'ok':'err');};
 
-/* ---- helpers ---- */
 function mean(a){return a.reduce((x,y)=>x+y,0)/a.length;}
-function ma(arr,n){return arr.length<n?null:mean(arr.slice(-n));}
+function ma(arr,n){return arr&&arr.length>=n?mean(arr.slice(-n)):null;}
 async function getJSON(u){const r=await fetch(u);if(!r.ok)throw new Error(r.status);return r.json();}
 async function getText(u){const r=await fetch(u);if(!r.ok)throw new Error(r.status);return r.text();}
 
 function stateCard(id,price,mm,unit,opts={}){
   const el=document.getElementById(id);if(!el)return;
-  const lab=el.querySelector('.lab');
   if(price==null||mm==null){el.querySelector('.big').textContent='—';
     el.insertAdjacentHTML('beforeend','<div class="row miss">'+(opts.miss||'données insuffisantes')+'</div>');return;}
   const above=price>=mm, dist=(price-mm)/mm*100;
-  lab.insertAdjacentHTML('beforeend','<span class="badge '+(above?'up':'down')+'">'+(above?'au-dessus':'en dessous')+'</span>');
+  el.querySelector('.lab').insertAdjacentHTML('beforeend','<span class="badge '+(above?'up':'down')+'">'+(above?'au-dessus':'en dessous')+'</span>');
   el.querySelector('.big').innerHTML=fmt(price,opts.dp||0)+' <span style="font-size:12px;color:var(--faint)">'+unit+'</span>';
   el.insertAdjacentHTML('beforeend',
     '<div class="row"><span>MM200</span><b>'+fmt(mm,opts.dp||0)+' '+unit+'</b></div>'+
     '<div class="row"><span>distance</span><b style="color:'+(above?'var(--pos)':'var(--neg)')+'">'+sign(dist)+' %</b></div>');
 }
-
 function lineChart(id,labels,series,opts={}){
-  if(!window.Chart)return;
-  const ctx=document.getElementById(id);if(!ctx)return;
+  if(!window.Chart)return; const ctx=document.getElementById(id);if(!ctx)return;
   new Chart(ctx,{type:'line',data:{labels,datasets:series},options:{
     responsive:true,maintainAspectRatio:false,interaction:{intersect:false,mode:'index'},
     plugins:{legend:{labels:{color:CHART_TICK,font:{family:'IBM Plex Mono',size:10},boxWidth:14}}},
@@ -195,115 +189,128 @@ function lineChart(id,labels,series,opts={}){
   }});
 }
 
-/* ---- 1. PRIX & MM200 ---- */
-let GOLD_USD=null, GOLD_DATES=null, CUR_USD=null, CUR_XAG=null;
-async function loadGoldHist(){
-  try{
-    const raw=await getJSON(SRC.goldHist);
-    const daily=raw.filter(r=>r.date>='2025-01-01'&&r.price>0).sort((a,b)=>a.date<b.date?-1:1);
-    GOLD_USD=daily.map(r=>+r.price); GOLD_DATES=daily.map(r=>r.date);
-    setChip('historique or',GOLD_USD.length>=200);
-    return GOLD_USD.length>=20;
-  }catch(e){setChip('historique or',false);return false;}
-}
+/* ---- état global ---- */
+let GOLD_USD=null,GOLD_DATES=null,SILVER_USD=null,SILVER_DATES=null,CUR_USD=null,CUR_XAG=null,HIST_SRC='',HIST_STALE=null,FX=null;
+
+/* ---- temps réel ---- */
 async function loadRT(){
   try{
     const [g,s]=await Promise.all([getJSON(SRC.goldRT),getJSON(SRC.silverRT)]);
     CUR_USD=+g.price; CUR_XAG=+s.price;
-    document.getElementById('d-gold-usd').textContent=g.updatedAt?('· '+(''+g.updatedAt).slice(0,10)):'';
-    setChip('prix RT',CUR_USD>0); return CUR_USD>0;
-  }catch(e){setChip('prix RT',false);return false;}
+    document.getElementById('d-gold-usd').textContent=g.updatedAt?('· '+(''+g.updatedAt).slice(0,10)):'· live';
+    setChip('prix RT',CUR_USD>0);
+  }catch(e){setChip('prix RT',false);}
 }
+
+/* ---- historique : flux auto-hébergé → Stooq(proxy) → freegoldapi ---- */
+function parseStooq(txt){
+  return txt.trim().split('\n').slice(1).map(l=>l.split(','))
+    .filter(c=>c.length>=5&&+c[4]>0).map(c=>({d:c[0],c:+c[4]})).sort((a,b)=>a.d<b.d?-1:1);
+}
+function ingest(gold,silver,eurusd){
+  if(gold&&gold.length){GOLD_DATES=gold.map(x=>x.d);GOLD_USD=gold.map(x=>x.c);}
+  if(silver&&silver.length){SILVER_DATES=silver.map(x=>x.d);SILVER_USD=silver.map(x=>x.c);}
+  if(eurusd&&eurusd.length){FX={};eurusd.forEach(x=>FX[x.d]=x.c);}
+}
+async function loadHistory(){
+  // 1) flux auto-hébergé (robuste)
+  try{const j=await getJSON(SRC.selfFeed);
+    if(j&&j.gold&&j.gold.length){ingest(j.gold,j.silver,j.eurusd);HIST_SRC='flux auto-hébergé';return finishHist();}}catch(e){}
+  // 2) Stooq via proxy CORS (stopgap, à jour)
+  try{const [g,sv,fx]=await Promise.all([
+        getText(SRC.proxy+encodeURIComponent(SRC.stooq('xauusd'))),
+        getText(SRC.proxy+encodeURIComponent(SRC.stooq('xagusd'))),
+        getText(SRC.proxy+encodeURIComponent(SRC.stooq('eurusd')))]);
+    const gp=parseStooq(g),sp=parseStooq(sv),fp=parseStooq(fx);
+    if(gp.length){ingest(gp,sp,fp);HIST_SRC='Stooq (proxy — stopgap)';return finishHist();}}catch(e){}
+  // 3) freegoldapi (dernier recours, possiblement périmé)
+  try{const raw=await getJSON(SRC.goldHistFallback);
+    const gp=raw.filter(r=>r.date>='2025-01-01'&&r.price>0).map(r=>({d:r.date,c:+r.price})).sort((a,b)=>a.d<b.d?-1:1);
+    if(gp.length){ingest(gp,null,null);HIST_SRC='freegoldapi (secours)';return finishHist();}}catch(e){}
+  setChip('historique',false); finishHist();
+}
+function finishHist(){
+  const ok=GOLD_USD&&GOLD_USD.length>=20; setChip('historique',ok);
+  if(ok){const last=GOLD_DATES[GOLD_DATES.length-1];
+    const days=Math.round((Date.now()-new Date(last).getTime())/864e5);
+    HIST_STALE=days>7?{last,days}:null;}
+  renderStale(); renderGoldUSD(); renderSilver(); renderRatio(); renderEUR(); renderATH();
+}
+function renderStale(){
+  const old=document.getElementById('stale-banner'); if(old)old.remove();
+  if(!HIST_STALE)return;
+  const b=document.createElement('div'); b.id='stale-banner';
+  b.style='background:rgba(226,115,92,.1);border:1px solid #4a2a22;color:var(--neg);border-radius:10px;padding:12px 16px;margin:14px 0;font-size:13px;line-height:1.5';
+  b.innerHTML='⚠ <b>Historique périmé</b> — dernier point le <b>'+HIST_STALE.last+'</b> (il y a '+HIST_STALE.days+' jours). MM200, graphe et distance à l\'ATH ne sont pas à jour. Source active : '+HIST_SRC+'. Mettre en place le flux auto-hébergé (fichier <code>update-metals.yml</code>) pour fiabiliser.';
+  document.querySelector('.read').after(b);
+}
+
+/* ---- 1. MM200 ---- */
 function renderGoldUSD(){
   const price=CUR_USD ?? (GOLD_USD?GOLD_USD[GOLD_USD.length-1]:null);
-  const mm=GOLD_USD?ma(GOLD_USD,200):null;
+  const mm=ma(GOLD_USD,200);
   stateCard('s-gold-usd',price,mm,'$',{miss:GOLD_USD?('n='+GOLD_USD.length+'/200 jours'):'indisponible'});
+  const src='Source : '+(HIST_SRC||'—')+'.';
   if(GOLD_USD&&GOLD_USD.length>=200){
-    const N=Math.min(GOLD_USD.length,400), lab=GOLD_DATES.slice(-N), px=GOLD_USD.slice(-N);
-    const mmS=px.map((_,i)=>{const g=GOLD_USD.slice(0,GOLD_USD.length-N+i+1);return g.length>=200?mean(g.slice(-200)):null;});
+    const N=Math.min(GOLD_USD.length,400),lab=GOLD_DATES.slice(-N),px=GOLD_USD.slice(-N);
+    const mmS=px.map((_,i)=>{const g=GOLD_USD.slice(0,GOLD_USD.length-N+i+1);return ma(g,200);});
     lineChart('chGold',lab,[
       {label:'Or ($/oz)',data:px,borderColor:'#e7be52',borderWidth:1.8,tension:.1},
-      {label:'MM200',data:mmS,borderColor:'#7eaccf',borderWidth:1.4,borderDash:[4,4],tension:.1}
-    ],{y:'$/oz'});
-    document.getElementById('n-gold').innerHTML='Série quotidienne depuis 2025 ('+GOLD_USD.length+' points). La MM200 est la moyenne des 200 dernières séances. <b>État, non signal</b> : un passage sous la MM200 fragilise la tendance sans la renverser mécaniquement.';
-  } else if(GOLD_USD){
-    document.getElementById('n-gold').innerHTML='<span class="miss">Historique quotidien insuffisant pour une MM200 fiable ('+GOLD_USD.length+'/200). Le graphe s\'affichera quand la source aura accumulé 200 séances depuis 2025.</span>';
-  }
+      {label:'MM200',data:mmS,borderColor:'#7eaccf',borderWidth:1.4,borderDash:[4,4],tension:.1}],{y:'$/oz'});
+    document.getElementById('n-gold').innerHTML=src+' La MM200 est la moyenne des 200 dernières séances. <b>État, non signal</b> : passer sous la MM200 fragilise la tendance sans la renverser mécaniquement.';
+  } else document.getElementById('n-gold').innerHTML='<span class="miss">'+src+' Historique quotidien insuffisant pour une MM200 ('+(GOLD_USD?GOLD_USD.length:0)+'/200).</span>';
 }
-async function loadEUR(){
-  try{
-    const [lat,ser]=await Promise.all([getJSON(SRC.fxLatest),getJSON(SRC.fxSeries)]);
-    const eurNow=lat.rates.EUR;
-    setChip('change EUR',!!eurNow);
-    if(GOLD_USD&&GOLD_DATES){
-      const fx=ser.rates||{};
-      const eurSeries=GOLD_DATES.map(d=>fx[d]?fx[d].EUR:null);
-      // forward-fill fx (jours non ouvrés)
-      let last=null; const ff=eurSeries.map(v=>{if(v!=null)last=v;return last;});
-      const goldEUR=GOLD_USD.map((p,i)=>ff[i]?p*ff[i]:null).filter(v=>v!=null);
-      const priceEUR=CUR_USD?CUR_USD*eurNow:(goldEUR.length?goldEUR[goldEUR.length-1]:null);
-      const mmEUR=goldEUR.length>=200?mean(goldEUR.slice(-200)):null;
-      stateCard('s-gold-eur',priceEUR,mmEUR,'€',{miss:'n='+goldEUR.length+'/200'});
-    } else stateCard('s-gold-eur',null,null,'€',{miss:'historique manquant'});
-  }catch(e){setChip('change EUR',false);stateCard('s-gold-eur',null,null,'€',{miss:'change indisponible'});}
+function renderSilver(){
+  const price=CUR_XAG ?? (SILVER_USD&&SILVER_USD.length?SILVER_USD[SILVER_USD.length-1]:null);
+  stateCard('s-silver',price,ma(SILVER_USD,200),'$',{dp:2,miss:SILVER_USD?('n='+SILVER_USD.length+'/200'):'série argent indisponible'});
 }
-async function loadSilverHist(){
-  try{
-    const txt=await getText(SRC.ratioHist);
-    const rows=txt.trim().split('\n').slice(1).map(l=>l.split(','));
-    // format: date, price(or USD), silver_oz_per_gold_oz
-    const m={}; rows.forEach(c=>{const d=c[0],g=+c[1],r=+c[2];if(d>='2025-01-01'&&g>0&&r>0)m[d]=g/r;});
-    const dates=Object.keys(m).sort();
-    const silverUSD=dates.map(d=>m[d]);
-    setChip('ratio argent',silverUSD.length>=20);
-    // panneau 1 : argent MM200
-    const sPrice=CUR_XAG ?? (silverUSD.length?silverUSD[silverUSD.length-1]:null);
-    const sMM=silverUSD.length>=200?mean(silverUSD.slice(-200)):null;
-    stateCard('s-silver',sPrice,sMM,'$',{dp:2,miss:silverUSD.length?('n='+silverUSD.length+'/200 (dérivé)'):'dérivé indisponible'});
-    document.getElementById('d-silver').textContent='· dérivé';
-    // panneau 2 : ratio
-    renderRatio(silverUSD,dates);
-    return true;
-  }catch(e){setChip('ratio argent',false);renderRatio(null,null);return false;}
+function renderEUR(){
+  // EUR/USD (Stooq eurusd = USD pour 1 EUR) ; or en EUR = or USD / (EUR/USD)
+  if(!FX||!GOLD_USD){setChip('change EUR',false);stateCard('s-gold-eur',null,null,'€',{miss:'taux EUR indisponible'});return;}
+  let last=null; const ff=GOLD_DATES.map(d=>{if(FX[d])last=FX[d];return last;});
+  const goldEUR=GOLD_USD.map((p,i)=>ff[i]?p/ff[i]:null).filter(v=>v!=null);
+  if(!goldEUR.length){setChip('change EUR',false);stateCard('s-gold-eur',null,null,'€',{miss:'alignement EUR impossible'});return;}
+  setChip('change EUR',true);
+  const lastRate=ff[ff.length-1];
+  const priceEUR=(CUR_USD&&lastRate)?CUR_USD/lastRate:goldEUR[goldEUR.length-1];
+  stateCard('s-gold-eur',priceEUR,ma(goldEUR,200),'€',{miss:'n='+goldEUR.length+'/200'});
 }
-function renderRatio(silverUSD,dates){
+
+/* ---- 2. ratio ---- */
+function renderRatio(){
   const ratioNow=(CUR_USD&&CUR_XAG)?CUR_USD/CUR_XAG:null;
   const el=document.getElementById('s-ratio');
-  if(ratioNow){el.querySelector('.big').textContent=fmt(ratioNow,1);
-    document.getElementById('d-ratio').textContent='· live';}
+  if(ratioNow){el.querySelector('.big').textContent=fmt(ratioNow,1);document.getElementById('d-ratio').textContent='· live';}
   else el.querySelector('.big').innerHTML='<span class="miss" style="font-size:13px">prix RT manquant</span>';
-  // ratio vs sa moyenne
   const el2=document.getElementById('s-ratio-ma');
-  if(silverUSD&&GOLD_USD&&dates){
-    const gmap={}; GOLD_DATES.forEach((d,i)=>gmap[d]=GOLD_USD[i]);
-    const ratSeries=dates.map((d,i)=>gmap[d]?gmap[d]/silverUSD[i]:null).filter(v=>v!=null);
+  if(SILVER_USD&&GOLD_USD&&SILVER_DATES){
+    const sm={};SILVER_DATES.forEach((d,i)=>sm[d]=SILVER_USD[i]);
+    const ratSeries=GOLD_DATES.map((d,i)=>sm[d]?GOLD_USD[i]/sm[d]:null).filter(v=>v!=null);
     const rMM=ratSeries.length>=100?mean(ratSeries.slice(-100)):null;
     if(ratioNow&&rMM){const above=ratioNow>=rMM;
       el2.querySelector('.big').innerHTML=fmt(rMM,1)+' <span style="font-size:12px;color:var(--faint)">MM100</span>';
       el2.querySelector('.lab').insertAdjacentHTML('beforeend','<span class="badge '+(above?'down':'up')+'">'+(above?'argent bon marché':'argent cher')+'</span>');
     } else el2.querySelector('.big').innerHTML='<span class="miss" style="font-size:13px">n insuffisant</span>';
   } else el2.querySelector('.big').innerHTML='<span class="miss" style="font-size:13px">historique manquant</span>';
-  document.getElementById('n-ratio').innerHTML='Ratio actuel '+(ratioNow?'<b>'+fmt(ratioNow,1)+'</b>':'—')+' : il faut '+(ratioNow?fmt(ratioNow,1):'—')+' onces d\'argent pour une once d\'or. Historiquement, un ratio très élevé a précédé des phases de rattrapage de l\'argent — sans garantie de calendrier. <b>Contexte, non signal.</b>';
+  document.getElementById('n-ratio').innerHTML='Ratio actuel '+(ratioNow?'<b>'+fmt(ratioNow,1)+'</b>':'—')+' : '+(ratioNow?fmt(ratioNow,1):'—')+' onces d\'argent pour une once d\'or. Un ratio très élevé a historiquement précédé des phases de rattrapage de l\'argent — sans calendrier garanti. <b>Contexte, non signal.</b>';
 }
 
 /* ---- 3. COT ---- */
 function readMM(row){
   const find=(dir)=>{for(const k in row){const kl=k.toLowerCase();
     if(kl.includes('m_money')&&kl.includes('positions')&&kl.includes(dir)&&kl.includes('all')
-       &&!kl.includes('spread')&&!kl.includes('change')&&!kl.includes('pct')&&!kl.includes('trader'))
-      return +row[k];}return NaN;};
-  const L=find('long'), S=find('short');
+       &&!kl.includes('spread')&&!kl.includes('change')&&!kl.includes('pct')&&!kl.includes('trader'))return +row[k];}return NaN;};
+  const L=find('long'),S=find('short');
   const dk=Object.keys(row).find(k=>k.toLowerCase().includes('report_date'));
-  return {date:row[dk]?(''+row[dk]).slice(0,10):null, L, S, net:L-S};
+  return {date:row[dk]?(''+row[dk]).slice(0,10):null,L,S,net:L-S};
 }
 async function loadCOT(name,cardId,dateId,wantChart){
   try{
     const rows=await getJSON(SRC.cot(name));
     const data=rows.map(readMM).filter(r=>!isNaN(r.net)&&r.date).sort((a,b)=>a.date<b.date?-1:1);
     if(!data.length)throw new Error('vide');
-    const cur=data[data.length-1];
-    const window=data.slice(-260).map(r=>r.net);
-    const pctile=window.filter(v=>v<=cur.net).length/window.length*100;
+    const cur=data[data.length-1], win=data.slice(-260).map(r=>r.net);
+    const pctile=win.filter(v=>v<=cur.net).length/win.length*100;
     const el=document.getElementById(cardId);
     el.querySelector('.big').innerHTML=fmt(cur.net)+' <span style="font-size:12px;color:var(--faint)">contrats</span>';
     document.getElementById(dateId).textContent='· '+cur.date;
@@ -313,10 +320,8 @@ async function loadCOT(name,cardId,dateId,wantChart){
       '<div class="bar au"><i style="width:'+Math.max(2,Math.min(100,pctile))+'%"></i></div>'+
       '<div class="row" style="font-size:10.5px"><span>net bas (5a)</span><span>net haut (5a)</span></div>');
     setChip(name==='GOLD'?'COT or':'COT argent',true);
-    if(wantChart){
-      const N=Math.min(data.length,156), lab=data.slice(-N).map(r=>r.date), net=data.slice(-N).map(r=>r.net);
-      lineChart('chCot',lab,[{label:'Net Managed Money — or (contrats)',data:net,borderColor:'#e7be52',borderWidth:1.8,fill:true,backgroundColor:'rgba(231,190,82,.08)',tension:.15}],{y:'contrats nets'});
-    }
+    if(wantChart){const N=Math.min(data.length,156),lab=data.slice(-N).map(r=>r.date),net=data.slice(-N).map(r=>r.net);
+      lineChart('chCot',lab,[{label:'Net Managed Money — or (contrats)',data:net,borderColor:'#e7be52',borderWidth:1.8,fill:true,backgroundColor:'rgba(231,190,82,.08)',tension:.15}],{y:'contrats nets'});}
   }catch(e){setChip(name==='GOLD'?'COT or':'COT argent',false);
     document.getElementById(cardId).querySelector('.big').innerHTML='<span class="miss" style="font-size:13px">source CFTC indisponible</span>';}
 }
@@ -324,10 +329,8 @@ async function loadCOT(name,cardId,dateId,wantChart){
 /* ---- 4. ATH ---- */
 function renderATH(){
   if(!GOLD_USD||GOLD_USD.length<20){document.getElementById('s-ath').querySelector('.big').innerHTML='<span class="miss" style="font-size:13px">historique manquant</span>';return;}
-  let athi=0; GOLD_USD.forEach((p,i)=>{if(p>GOLD_USD[athi])athi=i;});
-  const ath=GOLD_USD[athi], athDate=GOLD_DATES[athi];
-  const price=CUR_USD ?? GOLD_USD[GOLD_USD.length-1];
-  const draw=(price-ath)/ath*100;
+  let ai=0; GOLD_USD.forEach((p,i)=>{if(p>GOLD_USD[ai])ai=i;});
+  const ath=GOLD_USD[ai],athDate=GOLD_DATES[ai],price=CUR_USD ?? GOLD_USD[GOLD_USD.length-1],draw=(price-ath)/ath*100;
   const el=document.getElementById('s-ath');
   el.querySelector('.big').innerHTML='<span style="color:'+(draw<0?'var(--neg)':'var(--pos)')+'">'+sign(draw)+' %</span>';
   el.insertAdjacentHTML('beforeend','<div class="row"><span>ATH</span><b>'+fmt(ath)+' $ ('+athDate+')</b></div><div class="row"><span>actuel</span><b>'+fmt(price)+' $</b></div>');
@@ -335,15 +338,13 @@ function renderATH(){
   const el2=document.getElementById('s-consol');
   el2.querySelector('.big').innerHTML=fmt(days)+' <span style="font-size:12px;color:var(--faint)">jours</span>';
   el2.insertAdjacentHTML('beforeend','<div class="row"><span>soit</span><b>~'+fmt(days/30.4,1)+' mois</b></div>');
-  document.getElementById('n-ath').innerHTML='Sommet de la série quotidienne : <b>'+fmt(ath)+' $</b> le '+athDate+'. Une consolidation peut durer : après 2011, l\'or a mis des années à revoir ses sommets. <b>Du contexte, pas une cible.</b>';
+  document.getElementById('n-ath').innerHTML='Sommet de la série : <b>'+fmt(ath)+' $</b> le '+athDate+'. Une consolidation peut durer (cf. 2011-2015). <b>Du contexte, pas une cible.</b>';
 }
 
-/* ---- orchestration : chaque source indépendante, rendu progressif ---- */
+/* ---- orchestration ---- */
 (async()=>{
-  await Promise.all([loadRT(), loadGoldHist()]);
-  renderGoldUSD(); renderATH();
-  loadEUR();
-  loadSilverHist();
+  await loadRT();
+  await loadHistory();
   loadCOT('GOLD','s-cot-gold','d-cot-gold',true);
   loadCOT('SILVER','s-cot-silver','d-cot-silver',false);
 })();
