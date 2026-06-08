@@ -1,6 +1,7 @@
 name: update-metals
 
-# Met à jour data/metals_daily.json chaque jour (clôtures or + argent, source Stooq).
+# Met à jour data/metals_daily.json chaque jour (clôtures or, argent, EUR/USD).
+# Source serveur : Yahoo Finance (fonctionne depuis les runners GitHub), Stooq en secours.
 # Le compagnon tactique lit ce fichier en même origine : toujours frais, sans clé, sans CORS.
 
 on:
@@ -17,37 +18,63 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Récupérer or & argent (Stooq, clôtures quotidiennes)
+      - name: Récupérer or, argent, EUR/USD (Yahoo, secours Stooq)
         run: |
           python3 - << 'PY'
           import urllib.request, json, os, datetime
 
-          def fetch(sym):
-              url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
-              req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-              txt = urllib.request.urlopen(req, timeout=40).read().decode()
+          UA = {"User-Agent": "Mozilla/5.0"}
+
+          def yahoo(sym):
+              url = f"https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range=2y&interval=1d"
+              raw = urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=40).read()
+              j = json.loads(raw.decode())
+              res = j["chart"]["result"][0]
+              ts = res["timestamp"]
+              cl = res["indicators"]["quote"][0]["close"]
               out = []
-              for line in txt.strip().splitlines()[1:]:      # saute l'en-tête
+              for t, c in zip(ts, cl):
+                  if c is not None:
+                      d = datetime.datetime.utcfromtimestamp(t).strftime("%Y-%m-%d")
+                      out.append({"d": d, "c": round(float(c), 4)})
+              return out[-600:]
+
+          def stooq(sym):
+              url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
+              txt = urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=40).read().decode()
+              out = []
+              for line in txt.strip().splitlines()[1:]:
                   c = line.split(",")
                   if len(c) >= 5:
                       try:
-                          out.append({"d": c[0], "c": float(c[4])})  # Date, Close
+                          out.append({"d": c[0], "c": float(c[4])})
                       except ValueError:
                           pass
-              return out[-600:]                               # ~2,5 ans de séances
+              return out[-600:]
 
-          gold   = fetch("xauusd")
-          silver = fetch("xagusd")
-          eurusd = fetch("eurusd")
+          def fetch(yh, sq):
+              for fn, arg in ((yahoo, yh), (stooq, sq)):
+                  try:
+                      r = fn(arg)
+                      if len(r) >= 50:
+                          return r
+                  except Exception as e:
+                      print(f"WARN {fn.__name__}({arg}): {e}")
+              return []
+
+          gold   = fetch("GC=F", "xauusd")
+          silver = fetch("SI=F", "xagusd")
+          eurusd = fetch("EURUSD=X", "eurusd")
+
           if len(gold) < 50:
-              raise SystemExit("Échec récupération or (Stooq) — source à vérifier")
+              raise SystemExit("Échec or sur Yahoo ET Stooq — sources a verifier")
 
           data = {"updated": datetime.date.today().isoformat(),
                   "gold": gold, "silver": silver, "eurusd": eurusd}
           os.makedirs("data", exist_ok=True)
           with open("data/metals_daily.json", "w") as f:
               json.dump(data, f)
-          print(f"or={len(gold)} pts (dernier {gold[-1]['d']}), argent={len(silver)} pts, eurusd={len(eurusd)} pts")
+          print(f"or={len(gold)} (dernier {gold[-1]['d']}), argent={len(silver)}, eurusd={len(eurusd)}")
           PY
 
       - name: Publier
@@ -55,5 +82,5 @@ jobs:
           git config user.name  "metals-bot"
           git config user.email "metals-bot@users.noreply.github.com"
           git add data/metals_daily.json
-          git commit -m "maj métaux $(date -u +%F)" || echo "aucun changement"
+          git commit -m "maj metaux $(date -u +%F)" || echo "aucun changement"
           git push
